@@ -17,20 +17,22 @@ private enum Binding:
   case Node(alias: String, nodeType: NodeType, ds: ExternalDataSource)
   case Rel(alias: String, edgeType: EdgeType, ds: ExternalDataSource)
 
-private final case class FromItem(table: String, alias: String)
-private final case class JoinItem(
-    joinType: String,
-    table: String,
-    alias: String,
-    on: List[String]
-)
+private final case class CteStep(name: String, body: String)
 
+/**
+ * ClickHouse-oriented SQL funnel:
+ * each join CTE uses exactly two inputs —
+ *   FROM <puppygraph base table>
+ *   JOIN <previous filtered CTE> AS prev
+ */
 final class SqlConverter(schema: GraphSchema):
   private var bindings = Map.empty[String, Binding]
-  private var fromItem: Option[FromItem] = None
-  private var joins = Vector.empty[JoinItem]
-  private var wherePreds = Vector.empty[String]
+  private var steps = Vector.empty[CteStep]
+  private var cteBound = Set.empty[String]
+  /** When translating WHERE for a join, qualify this alias against the base table. */
+  private var exprBaseAlias: Option[String] = None
   private var anonSeq = 0
+  private var stepNum = 0
 
   def convert(query: Query): Either[String, String] =
     try Right(convertUnsafe(query))
@@ -48,86 +50,93 @@ final class SqlConverter(schema: GraphSchema):
     if matchClauses.isEmpty then fail("Query must contain at least one MATCH clause")
 
     matchClauses.foreach(processMatch)
-    render(returnClauses.head)
+    renderFinal(returnClauses.head)
+
+  // --- MATCH processing -------------------------------------------------------
 
   private def processMatch(m: Match): Unit =
-    val joinType = if m.optional then "LEFT JOIN" else "INNER JOIN"
-    val pendingOn = scala.collection.mutable.ArrayBuffer.empty[String]
+    if m.optional then fail("OPTIONAL MATCH is not supported in binary-join CTE mode yet")
 
-    m.pattern.parts.foreach: part =>
-      processElement(part.element, joinType, pendingOn)
+    val parts = m.pattern.parts.map(_.element)
 
-    m.where.foreach: w =>
-      val sql = exprSql(w)
-      if m.optional then pendingOn += sql
-      else wherePreds :+= sql
+    parts match
+      case (n: NodePattern) :: Nil =>
+        processNodeOnly(n, m.where)
+      case other =>
+        // Bind/seed path starts first so WHERE can resolve variables.
+        other.foreach:
+          case n: NodePattern =>
+            processNodeOnly(n, None)
+          case PathPattern(start, chain) =>
+            processPath(start, chain, m.where)
 
-    if pendingOn.nonEmpty then
-      if joins.nonEmpty then
-        val last = joins.last
-        joins = joins.init :+ last.copy(on = last.on ++ pendingOn.toVector)
-      else wherePreds ++= pendingOn.toVector
+  private def processNodeOnly(node: NodePattern, where: Option[Expr]): Unit =
+    val alias =
+      if node.variable.exists(bindings.contains) then
+        validateExistingNode(node)
+        node.variable.get
+      else ensureFreshNode(node)
+    if cteBound.contains(alias) then
+      where.foreach(w => emitFilter(List(exprSql(w))))
+    else
+      val b = nodeBinding(alias)
+      val preds =
+        propertyMapPreds(alias, b.nodeType, node.properties) ++
+          where.map(w => unqualifySeed(alias, b, exprSql(w))).toList
+      emitSeed(alias, b.ds.qualifiedTable, preds)
 
-  private def processElement(
-      element: PatternElement,
-      joinType: String,
-      pendingOn: scala.collection.mutable.ArrayBuffer[String]
+  private def processPath(
+      start: NodePattern,
+      chain: List[(RelationshipPattern, NodePattern)],
+      where: Option[Expr]
   ): Unit =
-    element match
-      case n: NodePattern =>
-        bindNode(n, joinType, pendingOn, deferTable = false)
-        ()
-      case PathPattern(start, chain) =>
-        // If FROM already exists, defer joining a new path-start node until the hop
-        // can attach it via relationship keys (avoids JOIN without ON).
-        val defer = fromItem.nonEmpty
-        var left = bindNode(start, joinType, pendingOn, deferTable = defer)
-        chain.foreach { case (rel, right) =>
-          left = bindHop(left, rel, right, joinType, pendingOn)
-        }
+    val startAlreadyLive = start.variable.exists(cteBound.contains)
+    var whereConsumedInSeed = false
 
-  private def bindNode(
-      node: NodePattern,
-      joinType: String,
-      pendingOn: scala.collection.mutable.ArrayBuffer[String],
-      deferTable: Boolean
-  ): String =
-    val alias = node.variable.getOrElse(freshAnon("n"))
-    bindings.get(alias) match
-      case Some(Binding.Node(_, existing, _)) =>
-        if node.labels.nonEmpty && !node.labels.contains(existing.label) then
-          fail(
-            s"Variable '$alias' already bound to label ${existing.label}, got ${node.labels}"
-          )
-        node.properties.foreach(props => pendingOn ++= propertyMapPreds(alias, existing, props))
-        alias
-      case Some(_: Binding.Rel) =>
-        fail(s"Variable '$alias' is already bound as a relationship")
-      case None =>
-        val label = node.labels.headOption.getOrElse(
-          fail(s"Node variable '$alias' requires a label on first mention")
-        )
-        if node.labels.size > 1 then fail(s"Multiple labels not supported: ${node.labels}")
-        val nodeType = schema.node(label).getOrElse(fail(s"Unknown node label: $label"))
-        val ds = nodeType.table.getOrElse(fail(s"Node label '$label' has no table mapping"))
-        bindings += alias -> Binding.Node(alias, nodeType, ds)
-        if !deferTable then addTable(ds.qualifiedTable, alias, joinType, Nil)
-        node.properties.foreach: props =>
-          val preds = propertyMapPreds(alias, nodeType, props)
-          if fromItem.exists(_.alias == alias) && joins.isEmpty then wherePreds ++= preds
-          else pendingOn ++= preds
-        alias
+    val startAlias =
+      if startAlreadyLive then
+        validateExistingNode(start)
+        start.variable.get
+      else if steps.isEmpty then
+        // First funnel step: seed the path-start node (optionally with WHERE).
+        val a =
+          if start.variable.exists(bindings.contains) then
+            validateExistingNode(start)
+            start.variable.get
+          else ensureFreshNode(start)
+        val b = nodeBinding(a)
+        val seedWhereExprs = where.filter(w => exprAliases(w).subsetOf(Set(a)))
+        whereConsumedInSeed = seedWhereExprs.isDefined
+        val seedWhere =
+          propertyMapPreds(a, b.nodeType, start.properties) ++
+            seedWhereExprs.map(w => unqualifySeed(a, b, exprSql(w))).toList
+        emitSeed(a, b.ds.qualifiedTable, seedWhere)
+        a
+      else
+        // Later funnel step with a new start: bind metadata only; hops join via an
+        // already-filtered endpoint (never reseed — that would drop prior rows).
+        if start.variable.exists(bindings.contains) then
+          validateExistingNode(start)
+          start.variable.get
+        else ensureFreshNode(start)
 
-  private def bindHop(
+    var leftAlias = startAlias
+    chain.zipWithIndex.foreach { case ((rel, right), idx) =>
+      val isLast = idx == chain.length - 1
+      val whereForHop = if isLast && !whereConsumedInSeed then where else None
+      leftAlias = processHop(leftAlias, rel, right, whereForHop)
+    }
+
+  private def processHop(
       leftAlias: String,
       rel: RelationshipPattern,
       right: NodePattern,
-      joinType: String,
-      pendingOn: scala.collection.mutable.ArrayBuffer[String]
+      where: Option[Expr]
   ): String =
     if rel.length.nonEmpty then fail("Variable-length relationships are not supported")
     if rel.types.isEmpty then fail("Relationship type is required")
     if rel.types.size > 1 then fail(s"Multiple relationship types not supported: ${rel.types}")
+    rel.properties.foreach(_ => fail("Relationship property maps are not supported yet"))
 
     val edgeType =
       schema.edge(rel.types.head).getOrElse(fail(s"Unknown relationship type: ${rel.types.head}"))
@@ -137,11 +146,12 @@ final class SqlConverter(schema: GraphSchema):
     val leftNode = nodeBinding(leftAlias)
     val outgoing =
       resolveOutgoing(rel.direction, edgeType, leftNode.nodeType.label, right.labels.headOption)
+    val expectedRight = if outgoing then edgeType.toNodeLabel else edgeType.fromNodeLabel
 
-    val expectedRightLabel =
-      if outgoing then edgeType.toNodeLabel else edgeType.fromNodeLabel
     val rightAlias = right.variable.getOrElse(freshAnon("n"))
-    ensureNodeBound(rightAlias, right, expectedRightLabel)
+    val rightIsNew = !cteBound.contains(rightAlias) && !bindings.contains(rightAlias)
+    if rightIsNew then ensureNodeBound(rightAlias, right, expectedRight)
+    else validateExistingNode(right.copy(variable = Some(rightAlias)))
 
     val relAlias = rel.variable.getOrElse(freshAnon("r"))
     if bindings.contains(relAlias) then fail(s"Variable '$relAlias' is already bound")
@@ -149,107 +159,236 @@ final class SqlConverter(schema: GraphSchema):
 
     val (fromAlias, toAlias) =
       if outgoing then (leftAlias, rightAlias) else (rightAlias, leftAlias)
-    val fromB = nodeBinding(fromAlias)
-    val toB = nodeBinding(toAlias)
 
-    val leftPresent = tablePresent(leftAlias)
-    val rightPresent = tablePresent(rightAlias)
+    // Join edge table to previous CTE. Anchor on whichever endpoint is already filtered.
+    val leftLive = cteBound.contains(leftAlias)
+    val rightLive = cteBound.contains(rightAlias)
 
-    if !leftPresent && rightPresent then
-      // Attach through the already-bound right endpoint, then join left.
-      val edgeOn =
-        if outgoing then
-          joinEquals(
-            keySourceCols(edgeType, edgeType.toKey, edgeDs),
-            relAlias,
-            idSourceCols(toB),
-            toAlias
-          )
-        else
-          joinEquals(
-            keySourceCols(edgeType, edgeType.fromKey, edgeDs),
-            relAlias,
-            idSourceCols(fromB),
-            fromAlias
-          )
-      addTable(edgeDs.qualifiedTable, relAlias, joinType, edgeOn)
-      val leftOn =
-        if outgoing then
-          joinEquals(
-            idSourceCols(fromB),
-            fromAlias,
-            keySourceCols(edgeType, edgeType.fromKey, edgeDs),
-            relAlias
-          )
-        else
-          joinEquals(
-            idSourceCols(toB),
-            toAlias,
-            keySourceCols(edgeType, edgeType.toKey, edgeDs),
-            relAlias
-          )
-      addTable(nodeBinding(leftAlias).ds.qualifiedTable, leftAlias, joinType, leftOn)
-    else
-      if !leftPresent then
-        addTable(nodeBinding(leftAlias).ds.qualifiedTable, leftAlias, joinType, Nil)
-
-      val edgeOn =
-        if outgoing then
-          joinEquals(
-            idSourceCols(fromB),
-            fromAlias,
-            keySourceCols(edgeType, edgeType.fromKey, edgeDs),
-            relAlias
-          )
-        else
-          joinEquals(
-            idSourceCols(toB),
-            toAlias,
-            keySourceCols(edgeType, edgeType.toKey, edgeDs),
-            relAlias
-          )
-      addTable(edgeDs.qualifiedTable, relAlias, joinType, edgeOn)
-
-      if !tablePresent(rightAlias) then
-        val rightOn =
-          if outgoing then
-            joinEquals(
-              keySourceCols(edgeType, edgeType.toKey, edgeDs),
-              relAlias,
-              idSourceCols(toB),
-              toAlias
-            )
-          else
-            joinEquals(
-              keySourceCols(edgeType, edgeType.fromKey, edgeDs),
-              relAlias,
-              idSourceCols(fromB),
-              fromAlias
-            )
-        addTable(nodeBinding(rightAlias).ds.qualifiedTable, rightAlias, joinType, rightOn)
+    val (onBaseCols, onPrevVar, onPrevFields) =
+      if leftLive && outgoing then
+        (keySourceCols(edgeType, edgeType.fromKey, edgeDs), leftAlias, idGraphFields(leftNode))
+      else if leftLive && !outgoing then
+        (keySourceCols(edgeType, edgeType.toKey, edgeDs), leftAlias, idGraphFields(leftNode))
+      else if rightLive && outgoing then
+        (keySourceCols(edgeType, edgeType.toKey, edgeDs), rightAlias, idGraphFields(nodeBinding(rightAlias)))
+      else if rightLive && !outgoing then
+        (keySourceCols(edgeType, edgeType.fromKey, edgeDs), rightAlias, idGraphFields(nodeBinding(rightAlias)))
       else
-        val linkOn =
-          if outgoing then
-            joinEquals(
-              keySourceCols(edgeType, edgeType.toKey, edgeDs),
-              relAlias,
-              idSourceCols(toB),
-              toAlias
-            )
-          else
-            joinEquals(
-              keySourceCols(edgeType, edgeType.fromKey, edgeDs),
-              relAlias,
-              idSourceCols(fromB),
-              fromAlias
-            )
-        val last = joins.last
-        joins = joins.init :+ last.copy(on = last.on ++ linkOn)
+        fail(s"Hop :${edgeType.label} has no filtered endpoint to join against")
 
-    right.properties.foreach: props =>
-      pendingOn ++= propertyMapPreds(rightAlias, nodeBinding(rightAlias).nodeType, props)
-    rel.properties.foreach(_ => fail("Relationship property maps are not supported yet"))
+    // Introduce / attach the other endpoint (possibly derived from the edge row).
+    val otherAlias = if leftLive then rightAlias else leftAlias
+    val otherIsNew = !cteBound.contains(otherAlias)
+    val derivedCols: List[String] =
+      if otherIsNew && nodeBinding(otherAlias).ds.qualifiedTable == edgeDs.qualifiedTable then
+        deriveNodeColsFromEdge(
+          otherAlias,
+          relAlias,
+          edgeType,
+          edgeDs,
+          nodeIsTo = otherAlias == toAlias
+        )
+      else Nil
+
+    def translateWhere(baseAlias: String): List[String] =
+      where match
+        case None => Nil
+        case Some(w) =>
+          exprBaseAlias = Some(baseAlias)
+          try List(exprSql(w))
+          finally exprBaseAlias = None
+
+    emitJoin(
+      baseTable = edgeDs.qualifiedTable,
+      baseAlias = relAlias,
+      onBaseCols = onBaseCols,
+      onPrevVar = onPrevVar,
+      onPrevFields = onPrevFields,
+      whereSql =
+        if derivedCols.nonEmpty && !otherIsNew then translateWhere(relAlias) else Nil,
+      introduce = List(relAlias),
+      extraCols = derivedCols
+    )
+    if derivedCols.nonEmpty then cteBound += otherAlias
+
+    if otherIsNew && derivedCols.isEmpty then
+      val other = nodeBinding(otherAlias)
+      val (baseCols, prevFields) =
+        if otherAlias == toAlias then
+          (idSourceCols(other), keyGraphFields(edgeType, edgeType.toKey))
+        else
+          (idSourceCols(other), keyGraphFields(edgeType, edgeType.fromKey))
+      emitJoin(
+        baseTable = other.ds.qualifiedTable,
+        baseAlias = otherAlias,
+        onBaseCols = baseCols,
+        onPrevVar = relAlias,
+        onPrevFields = prevFields,
+        whereSql = translateWhere(otherAlias),
+        introduce = List(otherAlias),
+        extraCols = Nil
+      )
+      right.properties.foreach: props =>
+        emitFilter(propertyMapPreds(otherAlias, other.nodeType, Some(props)))
+    else if otherIsNew && derivedCols.nonEmpty then
+      val w = translateWhere(relAlias)
+      if w.nonEmpty then emitFilter(w)
+      right.properties.foreach: props =>
+        emitFilter(propertyMapPreds(otherAlias, nodeBinding(otherAlias).nodeType, Some(props)))
+    else
+      val w = translateWhere(relAlias)
+      if w.nonEmpty then emitFilter(w)
+
     rightAlias
+
+  /** Columns that alias edge base-table fields onto a co-located node variable. */
+  private def deriveNodeColsFromEdge(
+      nodeAlias: String,
+      relAlias: String,
+      edgeType: EdgeType,
+      edgeDs: ExternalDataSource,
+      nodeIsTo: Boolean
+  ): List[String] =
+    val node = nodeBinding(nodeAlias)
+    val keyFields = if nodeIsTo then edgeType.toKey else edgeType.fromKey
+    val keySources = keySourceCols(edgeType, keyFields, edgeDs)
+    val idFields = idGraphFields(node)
+    if keySources.size != idFields.size then
+      fail(s"Cannot derive node '$nodeAlias' ids from edge '${edgeType.label}' keys")
+
+    nodeGraphFields(node).map: field =>
+      val src =
+        idFields.indexOf(field) match
+          case i if i >= 0 =>
+            qual(relAlias, keySources(i))
+          case _ =>
+            nodeColumn(node.nodeType, field) match
+              case Some(ncol) if keySources.contains(ncol) =>
+                qual(relAlias, ncol)
+              case Some(ncol) =>
+                // Mapped attribute sharing a physical column with an edge key/id.
+                relGraphFields(Binding.Rel(relAlias, edgeType, edgeDs))
+                  .flatMap(rf => edgeColumn(edgeType, edgeDs, rf).map(rf -> _))
+                  .find((_, col) => col == ncol)
+                  .map((rf, _) => qual(relAlias, edgeColumn(edgeType, edgeDs, rf).get))
+                  .getOrElse(qual(relAlias, ncol))
+              case None =>
+                fail(s"Cannot derive ${nodeAlias}.$field from edge $relAlias")
+      s"$src AS ${cteCol(nodeAlias, field)}"
+  // --- Emit primitives --------------------------------------------------------
+
+  private def emitSeed(alias: String, table: String, whereSql: List[String]): Unit =
+    val b = nodeBinding(alias)
+    val cols = nodeGraphFields(b).map: field =>
+      val col = nodeColumn(b.nodeType, field).getOrElse(fail(s"No column for $alias.$field"))
+      s"${qid(col)} AS ${cteCol(alias, field)}"
+    val sb = new StringBuilder
+    sb.append("SELECT\n  ")
+    sb.append(cols.mkString(",\n  "))
+    sb.append(s"\nFROM $table")
+    if whereSql.nonEmpty then
+      sb.append("\nWHERE ")
+      // seed WHERE uses unqualified / table columns; rewrite `alias.field` refs to source cols
+      sb.append(whereSql.map(unqualifySeed(alias, b, _)).mkString(" AND "))
+    flushStep(sb.toString)
+    cteBound += alias
+
+  /**
+   * Binary join step:
+   *   FROM <baseTable> AS <baseAlias>
+   *   INNER JOIN <prev> AS prev ON base.cols = prev.`var.field`
+   */
+  private def emitJoin(
+      baseTable: String,
+      baseAlias: String,
+      onBaseCols: List[String],
+      onPrevVar: String,
+      onPrevFields: List[String],
+      whereSql: List[String],
+      introduce: List[String],
+      extraCols: List[String]
+  ): Unit =
+    if steps.isEmpty then fail("Join step requires a previous CTE")
+    if onBaseCols.size != onPrevFields.size then
+      fail(s"Join key arity mismatch: $onBaseCols vs $onPrevFields")
+
+    val on = onBaseCols.zip(onPrevFields).map { case (bc, pf) =>
+      s"${qual(baseAlias, bc)} = prev.${cteCol(onPrevVar, pf)}"
+    }
+
+    val carried = cteBound.toList.sorted.flatMap(projectFromPrev)
+    val introduced = introduce.flatMap(projectFromBase(baseAlias, _))
+    val cols = carried ++ introduced ++ extraCols
+    if cols.isEmpty then fail("Join step projected no columns")
+
+    val sb = new StringBuilder
+    sb.append("SELECT\n  ")
+    sb.append(cols.mkString(",\n  "))
+    sb.append(s"\nFROM $baseTable AS ${qid(baseAlias)}")
+    sb.append(s"\nINNER JOIN ${steps.last.name} AS prev")
+    sb.append(s" ON ${on.mkString(" AND ")}")
+    if whereSql.nonEmpty then
+      sb.append("\nWHERE ")
+      sb.append(whereSql.mkString(" AND "))
+    flushStep(sb.toString)
+    cteBound ++= introduce
+
+  private def emitFilter(whereSql: List[String]): Unit =
+    if whereSql.isEmpty then return
+    if steps.isEmpty then fail("Filter step requires a previous CTE")
+    val cols = cteBound.toList.sorted.flatMap(projectFromPrev)
+    val sb = new StringBuilder
+    sb.append("SELECT\n  ")
+    sb.append(cols.mkString(",\n  "))
+    sb.append(s"\nFROM ${steps.last.name} AS prev")
+    sb.append("\nWHERE ")
+    sb.append(whereSql.mkString(" AND "))
+    flushStep(sb.toString)
+
+  private def flushStep(body: String): Unit =
+    stepNum += 1
+    steps :+= CteStep(s"step$stepNum", body)
+
+  private def projectFromPrev(name: String): List[String] =
+    graphFields(name).map: field =>
+      val c = cteCol(name, field)
+      s"prev.$c AS $c"
+
+  private def projectFromBase(baseAlias: String, name: String): List[String] =
+    bindings.get(name) match
+      case Some(n: Binding.Node) if name == baseAlias =>
+        nodeGraphFields(n).map: field =>
+          val col = nodeColumn(n.nodeType, field).getOrElse(fail(s"No column for $name.$field"))
+          s"${qual(baseAlias, col)} AS ${cteCol(name, field)}"
+      case Some(r: Binding.Rel) if name == baseAlias =>
+        relGraphFields(r).map: field =>
+          val col = edgeColumn(r.edgeType, r.ds, field).getOrElse(fail(s"No column for $name.$field"))
+          s"${qual(baseAlias, col)} AS ${cteCol(name, field)}"
+      case _ =>
+        fail(s"Cannot project '$name' from base alias '$baseAlias'")
+
+  private def graphFields(name: String): List[String] =
+    bindings.get(name) match
+      case Some(n: Binding.Node) => nodeGraphFields(n)
+      case Some(r: Binding.Rel)  => relGraphFields(r)
+      case None                  => fail(s"Unbound variable: $name")
+
+  // --- Binding helpers --------------------------------------------------------
+
+  private def ensureFreshNode(node: NodePattern): String =
+    val alias = node.variable.getOrElse(freshAnon("n"))
+    bindings.get(alias) match
+      case Some(_) =>
+        fail(s"Variable '$alias' is already bound")
+      case None =>
+        val label = node.labels.headOption.getOrElse(
+          fail(s"Node variable '$alias' requires a label on first mention")
+        )
+        if node.labels.size > 1 then fail(s"Multiple labels not supported: ${node.labels}")
+        val nodeType = schema.node(label).getOrElse(fail(s"Unknown node label: $label"))
+        val ds = nodeType.table.getOrElse(fail(s"Node label '$label' has no table mapping"))
+        bindings += alias -> Binding.Node(alias, nodeType, ds)
+        alias
 
   private def ensureNodeBound(alias: String, pattern: NodePattern, expectedLabel: String): Unit =
     bindings.get(alias) match
@@ -267,6 +406,15 @@ final class SqlConverter(schema: GraphSchema):
           schema.node(resolved).getOrElse(fail(s"Unknown node label: $resolved"))
         val ds = nodeType.table.getOrElse(fail(s"Node label '$resolved' has no table mapping"))
         bindings += alias -> Binding.Node(alias, nodeType, ds)
+
+  private def validateExistingNode(node: NodePattern): Unit =
+    val alias = node.variable.getOrElse(fail("Expected bound node variable"))
+    bindings.get(alias) match
+      case Some(Binding.Node(_, nt, _)) =>
+        if node.labels.nonEmpty && !node.labels.contains(nt.label) then
+          fail(s"Variable '$alias' label mismatch")
+      case Some(_) => fail(s"Variable '$alias' is not a node")
+      case None    => fail(s"Unbound variable: $alias")
 
   private def resolveOutgoing(
       direction: Direction,
@@ -288,20 +436,6 @@ final class SqlConverter(schema: GraphSchema):
               s"Cannot resolve undirected :${edge.label} between $leftLabel and ${rightLabel.getOrElse("?")}"
             )
 
-  private def addTable(
-      table: String,
-      alias: String,
-      joinType: String,
-      on: List[String]
-  ): Unit =
-    if tablePresent(alias) then ()
-    else if fromItem.isEmpty then fromItem = Some(FromItem(table, alias))
-    else if on.isEmpty then joins :+= JoinItem("CROSS JOIN", table, alias, Nil)
-    else joins :+= JoinItem(joinType, table, alias, on)
-
-  private def tablePresent(alias: String): Boolean =
-    fromItem.exists(_.alias == alias) || joins.exists(_.alias == alias)
-
   private def nodeBinding(alias: String): Binding.Node =
     bindings.get(alias) match
       case Some(n: Binding.Node) => n
@@ -311,6 +445,12 @@ final class SqlConverter(schema: GraphSchema):
   private def freshAnon(prefix: String): String =
     anonSeq += 1
     s"_$prefix$anonSeq"
+
+  private def idGraphFields(node: Binding.Node): List[String] =
+    node.nodeType.id.map(_.name)
+
+  private def keyGraphFields(edge: EdgeType, keys: List[GraphField]): List[String] =
+    keys.map(_.name)
 
   private def idSourceCols(node: Binding.Node): List[String] =
     node.nodeType.id.map: field =>
@@ -328,29 +468,14 @@ final class SqlConverter(schema: GraphSchema):
         fail(s"No SQL column mapping for edge key '${field.name}' on ${edge.label}")
       )
 
-  private def joinEquals(
-      leftCols: List[String],
-      leftAlias: String,
-      rightCols: List[String],
-      rightAlias: String
-  ): List[String] =
-    if leftCols.size != rightCols.size then
-      fail(s"Join key arity mismatch: $leftCols vs $rightCols")
-    leftCols.zip(rightCols).map { case (l, r) =>
-      s"${qual(leftAlias, l)} = ${qual(rightAlias, r)}"
-    }
-
   private def propertyMapPreds(
       alias: String,
       nodeType: NodeType,
-      props: MapLiteral
+      props: Option[MapLiteral]
   ): List[String] =
-    props.entries.map { case (key, value) =>
-      val col = nodeColumn(nodeType, key).getOrElse(
-        fail(s"Unknown property '$key' on node label ${nodeType.label}")
-      )
-      s"${qual(alias, col)} = ${exprSql(value)}"
-    }
+    props.toList.flatMap(_.entries.map { case (key, value) =>
+      s"${refVar(alias, key)} = ${exprSql(value)}"
+    })
 
   private def nodeColumn(nodeType: NodeType, graphField: String): Option[String] =
     nodeType.table.flatMap(_.sourceFor(graphField))
@@ -368,64 +493,118 @@ final class SqlConverter(schema: GraphSchema):
         )(graphField)
       )
 
+  private def nodeGraphFields(n: Binding.Node): List[String] =
+    if n.nodeType.attributes.nonEmpty then n.nodeType.attributes.map(_.name)
+    else n.nodeType.id.map(_.name)
+
+  private def relGraphFields(r: Binding.Rel): List[String] =
+    (r.edgeType.id ++ r.edgeType.fromKey ++ r.edgeType.toKey ++ r.edgeType.attributes)
+      .map(_.name)
+      .distinct
+
+  /** Reference a graph field — prev CTE, current join base table, or seed column. */
+  private def refVar(alias: String, graphField: String): String =
+    if cteBound.contains(alias) then s"prev.${cteCol(alias, graphField)}"
+    else
+      bindings.get(alias) match
+        case Some(n: Binding.Node) =>
+          val col = nodeColumn(n.nodeType, graphField).getOrElse(
+            fail(s"Unknown property '$graphField' on node '${n.nodeType.label}'")
+          )
+          if exprBaseAlias.contains(alias) then qual(alias, col)
+          else qid(col) // seed WHERE: unqualified source column
+        case Some(r: Binding.Rel) =>
+          val col = edgeColumn(r.edgeType, r.ds, graphField).getOrElse(
+            fail(s"Unknown property '$graphField' on relationship '${r.edgeType.label}'")
+          )
+          qual(alias, col)
+        case None =>
+          fail(s"Unbound variable: $alias")
+
+  private def cteCol(alias: String, graphField: String): String =
+    s"`$alias.$graphField`"
+
+  private def exprAliases(expr: Expr): Set[String] =
+    expr match
+      case Variable(name)                   => Set(name)
+      case Property(Variable(name), _)      => Set(name)
+      case Property(inner, _)               => exprAliases(inner)
+      case Not(e)                           => exprAliases(e)
+      case And(l, r)                        => exprAliases(l) ++ exprAliases(r)
+      case Or(l, r)                         => exprAliases(l) ++ exprAliases(r)
+      case Xor(l, r)                        => exprAliases(l) ++ exprAliases(r)
+      case Comparison(l, _, r)              => exprAliases(l) ++ exprAliases(r)
+      case Add(l, r)                        => exprAliases(l) ++ exprAliases(r)
+      case Subtract(l, r)                   => exprAliases(l) ++ exprAliases(r)
+      case Multiply(l, r)                   => exprAliases(l) ++ exprAliases(r)
+      case Divide(l, r)                     => exprAliases(l) ++ exprAliases(r)
+      case Modulo(l, r)                     => exprAliases(l) ++ exprAliases(r)
+      case Pow(l, r)                        => exprAliases(l) ++ exprAliases(r)
+      case UnaryPlus(e)                     => exprAliases(e)
+      case UnaryMinus(e)                    => exprAliases(e)
+      case IsNull(e)                        => exprAliases(e)
+      case IsNotNull(e)                     => exprAliases(e)
+      case In(l, r)                         => exprAliases(l) ++ exprAliases(r)
+      case StartsWith(l, r)                 => exprAliases(l) ++ exprAliases(r)
+      case EndsWith(l, r)                   => exprAliases(l) ++ exprAliases(r)
+      case Contains(l, r)                   => exprAliases(l) ++ exprAliases(r)
+      case RegexMatch(l, r)                 => exprAliases(l) ++ exprAliases(r)
+      case ListLiteral(els)                 => els.flatMap(exprAliases).toSet
+      case FunctionInvocation(_, _, args)   => args.flatMap(exprAliases).toSet
+      case HasLabels(Variable(name), _)     => Set(name)
+      case HasLabels(inner, _)              => exprAliases(inner)
+      case ContainerIndex(e, i)             => exprAliases(e) ++ exprAliases(i)
+      case MapLiteral(entries)              => entries.flatMap((_, v) => exprAliases(v)).toSet
+      case _: Literal | Parameter(_) | Star => Set.empty
+
+  private def unqualifySeed(alias: String, b: Binding.Node, whereSql: String): String =
+    // Replace prev.`alias.field` or `alias.field` with source column for seed FROM table.
+    var s = whereSql
+    nodeGraphFields(b).foreach: field =>
+      val col = nodeColumn(b.nodeType, field).getOrElse(field)
+      s = s.replace(s"prev.${cteCol(alias, field)}", qid(col))
+      s = s.replace(cteCol(alias, field), qid(col))
+      s = s.replace(s"$alias.$field", qid(col))
+    s
+
   // --- Expressions ------------------------------------------------------------
 
   private def exprSql(expr: Expr): String =
     expr match
       case Variable(name) =>
         bindings.get(name) match
-          case Some(n: Binding.Node) =>
-            // bare node var in scalar context is not valid alone; used in comparisons
-            qual(n.alias, idSourceCols(n).head)
-          case Some(r: Binding.Rel) =>
-            qual(r.alias, keySourceCols(r.edgeType, r.edgeType.id, r.ds).headOption.getOrElse(
-              fail(s"Relationship '$name' has no id columns")
-            ))
-          case None => fail(s"Unbound variable: $name")
+          case Some(n: Binding.Node) => refVar(n.alias, idGraphFields(n).head)
+          case Some(r: Binding.Rel)  => refVar(r.alias, relGraphFields(r).head)
+          case None                  => fail(s"Unbound variable: $name")
 
-      case Property(Variable(name), key) =>
-        bindings.get(name) match
-          case Some(n: Binding.Node) =>
-            val col = nodeColumn(n.nodeType, key).getOrElse(
-              fail(s"Unknown property '$key' on node '${n.nodeType.label}'")
-            )
-            qual(n.alias, col)
-          case Some(r: Binding.Rel) =>
-            val col = edgeColumn(r.edgeType, r.ds, key).getOrElse(
-              fail(s"Unknown property '$key' on relationship '${r.edgeType.label}'")
-            )
-            qual(r.alias, col)
-          case None => fail(s"Unbound variable: $name")
-
+      case Property(Variable(name), key) => refVar(name, key)
       case Property(_, _) => fail("Nested property access is not supported")
 
-      case StringLit(v)   => literalString(v)
-      case IntegerLit(v)  => v.toString
-      case FloatLit(v)    => v.toString
-      case BooleanLit(v)  => if v then "TRUE" else "FALSE"
-      case NullLit        => "NULL"
-      case Parameter(n)   => s"{$n}"
+      case StringLit(v)  => literalString(v)
+      case IntegerLit(v) => v.toString
+      case FloatLit(v)   => v.toString
+      case BooleanLit(v) => if v then "TRUE" else "FALSE"
+      case NullLit       => "NULL"
+      case Parameter(n)  => s"{$n}"
 
-      case Not(e)         => s"(NOT ${exprSql(e)})"
-      case And(l, r)      => s"(${exprSql(l)} AND ${exprSql(r)})"
-      case Or(l, r)       => s"(${exprSql(l)} OR ${exprSql(r)})"
-      case Xor(l, r)      => s"(${exprSql(l)} XOR ${exprSql(r)})"
+      case Not(e)    => s"(NOT ${exprSql(e)})"
+      case And(l, r) => s"(${exprSql(l)} AND ${exprSql(r)})"
+      case Or(l, r)  => s"(${exprSql(l)} OR ${exprSql(r)})"
+      case Xor(l, r) => s"(${exprSql(l)} XOR ${exprSql(r)})"
 
       case Comparison(l, op, r) =>
         (l, r) match
-          case (vl: Variable, vr: Variable) =>
-            nodeIdComparison(vl.name, vr.name, op)
-          case _ =>
-            s"${exprSql(l)} ${cmpOp(op)} ${exprSql(r)}"
+          case (vl: Variable, vr: Variable) => nodeIdComparison(vl.name, vr.name, op)
+          case _ => s"${exprSql(l)} ${cmpOp(op)} ${exprSql(r)}"
 
-      case Add(l, r)       => s"(${exprSql(l)} + ${exprSql(r)})"
-      case Subtract(l, r)  => s"(${exprSql(l)} - ${exprSql(r)})"
-      case Multiply(l, r)  => s"(${exprSql(l)} * ${exprSql(r)})"
-      case Divide(l, r)    => s"(${exprSql(l)} / ${exprSql(r)})"
-      case Modulo(l, r)    => s"(${exprSql(l)} % ${exprSql(r)})"
-      case Pow(l, r)       => s"pow(${exprSql(l)}, ${exprSql(r)})"
-      case UnaryPlus(e)    => s"(+${exprSql(e)})"
-      case UnaryMinus(e)   => s"(-${exprSql(e)})"
+      case Add(l, r)      => s"(${exprSql(l)} + ${exprSql(r)})"
+      case Subtract(l, r) => s"(${exprSql(l)} - ${exprSql(r)})"
+      case Multiply(l, r) => s"(${exprSql(l)} * ${exprSql(r)})"
+      case Divide(l, r)   => s"(${exprSql(l)} / ${exprSql(r)})"
+      case Modulo(l, r)   => s"(${exprSql(l)} % ${exprSql(r)})"
+      case Pow(l, r)      => s"pow(${exprSql(l)}, ${exprSql(r)})"
+      case UnaryPlus(e)   => s"(+${exprSql(e)})"
+      case UnaryMinus(e)  => s"(-${exprSql(e)})"
 
       case IsNull(e)       => s"(${exprSql(e)} IS NULL)"
       case IsNotNull(e)    => s"(${exprSql(e)} IS NOT NULL)"
@@ -442,8 +621,7 @@ final class SqlConverter(schema: GraphSchema):
 
       case HasLabels(Variable(name), labels) =>
         val n = nodeBinding(name)
-        if labels.forall(_ == n.nodeType.label) then "TRUE"
-        else "FALSE"
+        if labels.forall(_ == n.nodeType.label) then "TRUE" else "FALSE"
       case HasLabels(_, _) => fail("Unsupported label predicate")
 
       case MapLiteral(_) | ContainerIndex(_, _) | Star =>
@@ -452,14 +630,13 @@ final class SqlConverter(schema: GraphSchema):
   private def nodeIdComparison(left: String, right: String, op: CmpOp): String =
     val l = nodeBinding(left)
     val r = nodeBinding(right)
-    val lcols = idSourceCols(l)
-    val rcols = idSourceCols(r)
-    if lcols.size != rcols.size then fail(s"Cannot compare nodes $left and $right: id arity mismatch")
+    val lcols = idGraphFields(l)
+    val rcols = idGraphFields(r)
+    if lcols.size != rcols.size then fail(s"Cannot compare nodes $left and $right")
     val parts = lcols.zip(rcols).map { case (lc, rc) =>
-      s"${qual(l.alias, lc)} ${cmpOp(op)} ${qual(r.alias, rc)}"
+      s"${refVar(l.alias, lc)} ${cmpOp(op)} ${refVar(r.alias, rc)}"
     }
-    if parts.size == 1 then parts.head
-    else parts.mkString("(", s" AND ", ")")
+    if parts.size == 1 then parts.head else parts.mkString("(", " AND ", ")")
 
   private def cmpOp(op: CmpOp): String =
     op match
@@ -480,83 +657,74 @@ final class SqlConverter(schema: GraphSchema):
     if name.matches("[A-Za-z_][A-Za-z0-9_]*") then name
     else s"`${name.replace("`", "``")}`"
 
-  // --- SELECT / render --------------------------------------------------------
+  // --- Final render -----------------------------------------------------------
 
-  private def render(ret: Return): String =
+  private def renderFinal(ret: Return): String =
     val selectItems =
       if ret.items.size == 1 && ret.items.head.expr == Star then
-        bindings.keys.toList.sorted.flatMap(expandVariable)
+        bindings.keys.toList.sorted.flatMap(projectFinalVar)
       else ret.items.flatMap(projectReturnItem)
 
     if selectItems.isEmpty then fail("RETURN produced no columns")
+    if steps.isEmpty then fail("No CTE steps generated")
 
     val sb = new StringBuilder
-    sb.append("SELECT")
-    if ret.distinct then sb.append(" DISTINCT")
-    sb.append("\n  ")
+    sb.append("WITH\n")
+    steps.zipWithIndex.foreach { case (step, idx) =>
+      if idx > 0 then sb.append(",\n")
+      sb.append(s"${step.name} AS (\n")
+      sb.append(indent(step.body, 2))
+      sb.append("\n)")
+    }
+    sb.append("\nSELECT\n  ")
     sb.append(selectItems.mkString(",\n  "))
-    sb.append("\nFROM ")
-    val from = fromItem.getOrElse(fail("No FROM clause generated"))
-    sb.append(s"${from.table} AS ${qid(from.alias)}")
-    joins.foreach: j =>
-      sb.append(s"\n${j.joinType} ${j.table} AS ${qid(j.alias)}")
-      if j.on.nonEmpty then sb.append(s" ON ${j.on.mkString(" AND ")}")
-    if wherePreds.nonEmpty then
-      sb.append("\nWHERE ")
-      sb.append(wherePreds.mkString(" AND "))
+    sb.append(s"\nFROM ${steps.last.name} AS prev")
     if ret.orderBy.nonEmpty then
+      // ORDER BY refs use prev.`var.field`
+      val saved = cteBound
+      cteBound = bindings.keySet
       sb.append("\nORDER BY ")
       sb.append(
         ret.orderBy
           .map(si => s"${exprSql(si.expr)}${if si.ascending then "" else " DESC"}")
           .mkString(", ")
       )
-    ret.skip.foreach(s => sb.append(s"\nOFFSET ${exprSql(s)}"))
-    ret.limit.foreach(l => sb.append(s"\nLIMIT ${exprSql(l)}"))
+      cteBound = saved
+    ret.skip.foreach: s =>
+      cteBound = bindings.keySet
+      sb.append(s"\nOFFSET ${exprSql(s)}")
+    ret.limit.foreach: l =>
+      cteBound = bindings.keySet
+      sb.append(s"\nLIMIT ${exprSql(l)}")
     sb.toString
+
+  private def indent(text: String, spaces: Int): String =
+    val pad = " " * spaces
+    text.split("\n", -1).map(pad + _).mkString("\n")
 
   private def projectReturnItem(item: ReturnItem): List[String] =
     item.expr match
       case Variable(name) =>
-        val cols = expandVariable(name)
+        val cols = projectFinalVar(name)
         item.alias match
           case None => cols
           case Some(a) if cols.size == 1 =>
             List(cols.head.replaceAll(" AS `[^`]+`$", s" AS ${qid(a)}"))
-          case Some(_) =>
-            fail(s"Cannot alias expanded variable '$name' to a single name")
-      case Star =>
-        fail("RETURN * mixed with other items is not supported")
+          case Some(_) => fail(s"Cannot alias expanded variable '$name'")
+      case Star => fail("RETURN * mixed with other items is not supported")
       case other =>
+        cteBound = bindings.keySet
         val sql = exprSql(other)
         val alias = item.alias.getOrElse(defaultAlias(other))
         List(s"$sql AS ${qid(alias)}")
+
+  private def projectFinalVar(name: String): List[String] =
+    graphFields(name).map: field =>
+      val col = cteCol(name, field)
+      s"prev.$col AS $col"
 
   private def defaultAlias(expr: Expr): String =
     expr match
       case Property(Variable(n), key) => s"$n.$key"
       case Variable(n)                => n
       case _                          => "expr"
-
-  private def expandVariable(name: String): List[String] =
-    bindings.get(name) match
-      case Some(n: Binding.Node) =>
-        val fields =
-          if n.nodeType.attributes.nonEmpty then n.nodeType.attributes.map(_.name)
-          else n.nodeType.id.map(_.name)
-        fields.map: field =>
-          val col = nodeColumn(n.nodeType, field).getOrElse(
-            fail(s"No SQL column for '${n.nodeType.label}.$field'")
-          )
-          s"${qual(n.alias, col)} AS `${n.alias}.$field`"
-      case Some(r: Binding.Rel) =>
-        val fields =
-          (r.edgeType.id ++ r.edgeType.fromKey ++ r.edgeType.toKey ++ r.edgeType.attributes)
-            .map(_.name)
-            .distinct
-        fields.map: field =>
-          val col = edgeColumn(r.edgeType, r.ds, field).getOrElse(
-            fail(s"No SQL column for relationship field '$field'")
-          )
-          s"${qual(r.alias, col)} AS `${r.alias}.$field`"
-      case None => fail(s"Unbound variable in RETURN: $name")
