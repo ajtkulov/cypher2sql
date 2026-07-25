@@ -9,6 +9,17 @@ lazy val root = (project in file("."))
       "io.circe" %% "circe-core"    % "0.14.12",
       "io.circe" %% "circe-generic" % "0.14.12",
       "io.circe" %% "circe-parser"  % "0.14.12",
+      "org.rogach" %% "scallop" % "5.3.0",
       "org.scalatest" %% "scalatest" % "3.2.19" % Test
-    )
+    ),
+    Compile / mainClass := Some("cypher2sql.main"),
+    assembly / mainClass := Some("cypher2sql.main"),
+    assembly / assemblyJarName := s"${name.value}-assembly-${version.value}.jar",
+    assembly / assemblyMergeStrategy := {
+      case PathList("META-INF", _*) => MergeStrategy.discard
+      case "module-info.class"      => MergeStrategy.discard
+      case x =>
+        val oldStrategy = (assembly / assemblyMergeStrategy).value
+        oldStrategy(x)
+    }
   )

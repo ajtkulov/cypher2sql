@@ -1,0 +1,4 @@
+#sbt "run --schema schema.json --cypher query.cypher"
+
+java -jar target/scala-3.3.6/cypher2sql-assembly-0.1.0-SNAPSHOT.jar \
+  --schema schema.json --cypher query.cypher
