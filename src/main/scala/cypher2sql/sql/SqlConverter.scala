@@ -198,46 +198,52 @@ final class SqlConverter(schema: GraphSchema):
           try List(exprSql(w))
           finally exprBaseAlias = None
 
-    emitJoin(
-      baseTable = edgeDs.qualifiedTable,
-      baseAlias = relAlias,
-      onBaseCols = onBaseCols,
-      onPrevVar = onPrevVar,
-      onPrevFields = onPrevFields,
-      whereSql =
-        if derivedCols.nonEmpty && !otherIsNew then translateWhere(relAlias) else Nil,
-      introduce = List(relAlias),
-      extraCols = derivedCols
-    )
-    if derivedCols.nonEmpty then cteBound += otherAlias
-
+    // Push filters into the join that first exposes the referenced columns —
+    // never emit a separate filter-only CTE after a hop.
     if otherIsNew && derivedCols.isEmpty then
+      emitJoin(
+        baseTable = edgeDs.qualifiedTable,
+        baseAlias = relAlias,
+        onBaseCols = onBaseCols,
+        onPrevVar = onPrevVar,
+        onPrevFields = onPrevFields,
+        whereSql = Nil,
+        introduce = List(relAlias),
+        extraCols = Nil
+      )
       val other = nodeBinding(otherAlias)
       val (baseCols, prevFields) =
         if otherAlias == toAlias then
           (idSourceCols(other), keyGraphFields(edgeType, edgeType.toKey))
         else
           (idSourceCols(other), keyGraphFields(edgeType, edgeType.fromKey))
+      val propPreds = propertyMapPredsOnBase(otherAlias, other.nodeType, right.properties)
       emitJoin(
         baseTable = other.ds.qualifiedTable,
         baseAlias = otherAlias,
         onBaseCols = baseCols,
         onPrevVar = relAlias,
         onPrevFields = prevFields,
-        whereSql = translateWhere(otherAlias),
+        whereSql = translateWhere(otherAlias) ++ propPreds,
         introduce = List(otherAlias),
         extraCols = Nil
       )
-      right.properties.foreach: props =>
-        emitFilter(propertyMapPreds(otherAlias, other.nodeType, Some(props)))
-    else if otherIsNew && derivedCols.nonEmpty then
-      val w = translateWhere(relAlias)
-      if w.nonEmpty then emitFilter(w)
-      right.properties.foreach: props =>
-        emitFilter(propertyMapPreds(otherAlias, nodeBinding(otherAlias).nodeType, Some(props)))
     else
-      val w = translateWhere(relAlias)
-      if w.nonEmpty then emitFilter(w)
+      val propPreds =
+        if otherIsNew then
+          propertyMapPredsOnBase(relAlias, nodeBinding(otherAlias).nodeType, right.properties)
+        else Nil
+      emitJoin(
+        baseTable = edgeDs.qualifiedTable,
+        baseAlias = relAlias,
+        onBaseCols = onBaseCols,
+        onPrevVar = onPrevVar,
+        onPrevFields = onPrevFields,
+        whereSql = translateWhere(relAlias) ++ propPreds,
+        introduce = List(relAlias),
+        extraCols = derivedCols
+      )
+      if derivedCols.nonEmpty then cteBound += otherAlias
 
     rightAlias
 
@@ -477,6 +483,19 @@ final class SqlConverter(schema: GraphSchema):
       s"${refVar(alias, key)} = ${exprSql(value)}"
     })
 
+  /** Property-map predicates qualified against the current join base table. */
+  private def propertyMapPredsOnBase(
+      baseAlias: String,
+      nodeType: NodeType,
+      props: Option[MapLiteral]
+  ): List[String] =
+    props.toList.flatMap(_.entries.map { case (key, value) =>
+      val col = nodeColumn(nodeType, key).getOrElse(
+        fail(s"Unknown property '$key' on node '${nodeType.label}'")
+      )
+      s"${qual(baseAlias, col)} = ${exprSql(value)}"
+    })
+
   private def nodeColumn(nodeType: NodeType, graphField: String): Option[String] =
     nodeType.table.flatMap(_.sourceFor(graphField))
       .orElse(Option.when(nodeType.attributes.exists(_.name == graphField))(graphField))
@@ -511,8 +530,9 @@ final class SqlConverter(schema: GraphSchema):
           val col = nodeColumn(n.nodeType, graphField).getOrElse(
             fail(s"Unknown property '$graphField' on node '${n.nodeType.label}'")
           )
-          if exprBaseAlias.contains(alias) then qual(alias, col)
-          else qid(col) // seed WHERE: unqualified source column
+          // Join WHERE: columns live on the join base (edge or node table).
+          // Seed WHERE: unqualified source column.
+          exprBaseAlias.map(base => qual(base, col)).getOrElse(qid(col))
         case Some(r: Binding.Rel) =>
           val col = edgeColumn(r.edgeType, r.ds, graphField).getOrElse(
             fail(s"Unknown property '$graphField' on relationship '${r.edgeType.label}'")

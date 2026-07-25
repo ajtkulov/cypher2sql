@@ -106,6 +106,48 @@ class SqlConverterSpec extends AnyFlatSpec with Matchers:
     got should include("INNER JOIN step1 AS prev")
     normalize(got) should include("prev.`r.puppy_id_person_hash` AS `r.puppy_id_person_hash`")
 
+  it should "fuse property-map filters into the join step" in:
+    val got = sql(
+      """
+        MATCH (p:Person)-[r:CITIZENSHIP]->(c:Citizenship {name: 'RU'})
+        RETURN p.person_hash, c.name
+      """
+    )
+    normalize(got) shouldBe normalize(
+      """
+        WITH
+        step1 AS (
+          SELECT
+            person_hash AS `p.person_hash`,
+            first_name AS `p.first_name`,
+            last_name AS `p.last_name`,
+            middle_name AS `p.middle_name`,
+            birth_date AS `p.birth_date`
+          FROM puppy.people_agg
+        ),
+        step2 AS (
+          SELECT
+            prev.`p.person_hash` AS `p.person_hash`,
+            prev.`p.first_name` AS `p.first_name`,
+            prev.`p.last_name` AS `p.last_name`,
+            prev.`p.middle_name` AS `p.middle_name`,
+            prev.`p.birth_date` AS `p.birth_date`,
+            r.person_hash AS `r.puppy_id_person_hash`,
+            r.citizenship AS `r.puppy_id_citizenship`,
+            r.person_hash AS `r.puppy_from_person_hash`,
+            r.citizenship AS `r.puppy_to_citizenship`,
+            r.citizenship AS `c.name`
+          FROM puppy.people_citizenship AS r
+          INNER JOIN step1 AS prev ON r.person_hash = prev.`p.person_hash`
+          WHERE r.citizenship = 'RU'
+        )
+        SELECT
+          prev.`p.person_hash` AS `p.person_hash`,
+          prev.`c.name` AS `c.name`
+        FROM step2 AS prev
+      """
+    )
+
   it should "fail on unknown node label" in:
     Cypher2Sql.convert("MATCH (x:Unknown) RETURN x", schema) match
       case Left(err) => err should include("Unknown node label")
