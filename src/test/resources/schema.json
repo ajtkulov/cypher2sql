@@ -1,0 +1,165 @@
+{
+  "catalog": [
+    {
+      "name": "clickhouse_data",
+      "type": "clickhouse",
+      "jdbc": {
+        "username": "default",
+        "jdbcUri": "jdbc:ch://172.17.0.1:8123",
+        "enableMetaCache": "true",
+        "metaCacheExpireSec": "600"
+      }
+    }
+  ],
+  "node": [
+    {
+      "dataSourceGroup": {
+        "externalDataSource": {
+          "enabled": true,
+          "catalog": "clickhouse_data",
+          "schema": "puppy",
+          "table": "people_agg",
+          "mappedField": [
+            {
+              "sourceFieldName": "person_hash",
+              "targetFieldName": "person_hash"
+            },
+            {
+              "sourceFieldName": "first_name",
+              "targetFieldName": "first_name"
+            },
+            {
+              "sourceFieldName": "last_name",
+              "targetFieldName": "last_name"
+            },
+            {
+              "sourceFieldName": "middle_name",
+              "targetFieldName": "middle_name"
+            },
+            {
+              "sourceFieldName": "birth_date",
+              "targetFieldName": "birth_date"
+            }
+          ]
+        }
+      },
+      "label": "Person",
+      "id": [
+        {
+          "name": "person_hash",
+          "type": "STRING"
+        }
+      ],
+      "attribute": [
+        {
+          "name": "person_hash",
+          "type": "STRING"
+        },
+        {
+          "name": "first_name",
+          "type": "STRING"
+        },
+        {
+          "name": "last_name",
+          "type": "STRING"
+        },
+        {
+          "name": "middle_name",
+          "type": "STRING"
+        },
+        {
+          "name": "birth_date",
+          "type": "STRING"
+        }
+      ]
+    },
+    {
+      "dataSourceGroup": {
+        "externalDataSource": {
+          "enabled": true,
+          "catalog": "clickhouse_data",
+          "schema": "puppy",
+          "table": "people_citizenship",
+          "mappedField": [
+            {
+              "sourceFieldName": "citizenship",
+              "targetFieldName": "citizenship"
+            },
+            {
+              "sourceFieldName": "citizenship",
+              "targetFieldName": "name"
+            }
+          ]
+        }
+      },
+      "label": "Citizenship",
+      "id": [
+        {
+          "name": "citizenship",
+          "type": "STRING"
+        }
+      ],
+      "attribute": [
+        {
+          "name": "name",
+          "type": "STRING"
+        }
+      ]
+    }
+  ],
+  "edge": [
+    {
+      "dataSourceGroup": {
+        "externalDataSource": {
+          "enabled": true,
+          "catalog": "clickhouse_data",
+          "schema": "puppy",
+          "table": "people_citizenship",
+          "mappedField": [
+            {
+              "sourceFieldName": "person_hash",
+              "targetFieldName": "puppy_id_person_hash"
+            },
+            {
+              "sourceFieldName": "citizenship",
+              "targetFieldName": "puppy_id_citizenship"
+            },
+            {
+              "sourceFieldName": "person_hash",
+              "targetFieldName": "puppy_from_person_hash"
+            },
+            {
+              "sourceFieldName": "citizenship",
+              "targetFieldName": "puppy_to_citizenship"
+            }
+          ]
+        }
+      },
+      "label": "CITIZENSHIP",
+      "fromNodeLabel": "Person",
+      "toNodeLabel": "Citizenship",
+      "id": [
+        {
+          "name": "puppy_id_person_hash",
+          "type": "STRING"
+        },
+        {
+          "name": "puppy_id_citizenship",
+          "type": "STRING"
+        }
+      ],
+      "fromKey": [
+        {
+          "name": "puppy_from_person_hash",
+          "type": "STRING"
+        }
+      ],
+      "toKey": [
+        {
+          "name": "puppy_to_citizenship",
+          "type": "STRING"
+        }
+      ]
+    }
+  ]
+}
