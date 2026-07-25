@@ -1,39 +1,37 @@
 package cypher2sql
 
-import cypher2sql.parser.CypherParser
+import cypher2sql.schema.SchemaReader
+import cypher2sql.sql.Cypher2Sql
+
+import java.nio.file.Path
 
 @main def main(args: String*): Unit =
-  val cypher =
-    if args.nonEmpty then args.mkString(" ")
-    else
-      """
-        MATCH (a:Person)-[r:KNOWS]->(b:Person)
-        WHERE a.age > 30
-        RETURN a.name, b.name AS friend
-        ORDER BY a.age DESC
-        LIMIT 10
-      """
+  val (schemaPath, cypherArgs) =
+    args.toList match
+      case "--schema" :: path :: rest => (path, rest)
+      case rest                       => ("schema.json", rest)
 
-  CypherParser.parse(cypher) match
-    case Right(query) =>
-      println("Parsed IR/AST:")
-      pprint(query)
+  val schema = SchemaReader.readPath(Path.of(schemaPath)).orElse(
+    SchemaReader.readResource(schemaPath)
+  ) match
+    case Right(s)  => s
     case Left(err) =>
       System.err.println(err)
       sys.exit(1)
 
-private def pprint(value: Any, indent: Int = 0): Unit =
-  val pad = "  " * indent
-  value match
-    case s: String =>
-      println(s"$pad$s")
-    case p: Product if p.productArity > 0 =>
-      println(s"$pad${p.productPrefix}(")
-      p.productIterator.foreach(pprint(_, indent + 1))
-      println(s"$pad)")
-    case xs: Iterable[?] =>
-      println(s"$pad[")
-      xs.foreach(pprint(_, indent + 1))
-      println(s"$pad]")
-    case other =>
-      println(s"$pad$other")
+  val cypher =
+    if cypherArgs.nonEmpty then cypherArgs.mkString(" ")
+    else
+      """
+        MATCH (p:Person)-[r:CITIZENSHIP]->(c:Citizenship)
+        WHERE p.last_name = 'John'
+        RETURN p, c.name
+        LIMIT 100
+      """
+
+  Cypher2Sql.convert(cypher, schema) match
+    case Right(sql) =>
+      println(sql)
+    case Left(err) =>
+      System.err.println(err)
+      sys.exit(1)
