@@ -1,6 +1,6 @@
 package cypher2sql
 
-import cypher2sql.schema.SchemaReader
+import cypher2sql.schema.{SchemaReader, TableSizeReader, TableSizes}
 import cypher2sql.sql.Cypher2Sql
 import org.rogach.scallop.*
 
@@ -11,6 +11,11 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments):
     name = "schema",
     descr = "Path to schema JSON (file or classpath resource)",
     default = Some("schema.json")
+  )
+  val tableSize = opt[String](
+    name = "table-size",
+    descr = "Path to table_size.json (file or classpath resource)",
+    default = Some("table_size.json")
   )
   val cypher = opt[Path](
     name = "cypher",
@@ -31,6 +36,13 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments):
       System.err.println(err)
       sys.exit(1)
 
+  val tableSizePath = conf.tableSize()
+  val tableSizes = TableSizeReader.readPath(Path.of(tableSizePath)).orElse(
+    TableSizeReader.readResource(tableSizePath)
+  ) match
+    case Right(s) => s
+    case Left(_)  => TableSizes(Nil)
+
   val cypher =
     conf.cypher.toOption match
       case Some(path) =>
@@ -46,7 +58,7 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments):
           LIMIT 100
         """
 
-  Cypher2Sql.convert(cypher, schema) match
+  Cypher2Sql.convert(cypher, schema, tableSizes) match
     case Right(sql) =>
       println(sql)
     case Left(err) =>

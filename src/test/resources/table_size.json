@@ -1,0 +1,4 @@
+[
+  {"schema": "puppy", "table_name": "people_agg", "rows": 15},
+  {"schema": "puppy", "table_name": "tag_all", "rows": 40}
+]
