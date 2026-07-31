@@ -1,0 +1,47 @@
+schema: spec-driven
+
+context: |
+  Project: cypher2sql — Scala 3 CLI that translates a Cypher subset into
+  ClickHouse-oriented SQL (WITH stepN CTE funnel) for PuppyGraph-shaped schemas.
+
+  Tech stack:
+  - Scala 3.3.6, sbt, assembly JAR
+  - scala-parser-combinators, circe (schema JSON), scallop (CLI), scalatest
+
+  Pipeline:
+  Cypher text → CypherParser → AST → SqlConverter(schema, tableSizes) → SQL string
+
+  Important invariants:
+  - Each join CTE uses exactly two inputs: physical table JOIN previous CTE (or
+    first-hop physical/physical fuse). Intermediate CTEs are assumed smaller
+    than any table in table_size.json.
+  - Node CTE projections MUST include id fields union attributes (distinct) so
+    later hops can join on node IDs even when attributes also exist
+    (e.g. INN.innCode + INN.code).
+  - Graph field names are schema targetFieldName values; physical columns come
+    from mappedField sourceFieldName (with name fallback).
+  - Parser accepts a broader Cypher surface than the converter; conversion
+    failures are explicit Left(message) / fail(), not silent parse rejects.
+
+  Non-goals today:
+  - OPTIONAL MATCH, WITH, variable-length paths, multi-type relationships,
+    relationship property maps, nested property access, CREATE/MERGE/DELETE.
+  - Emitting SELECT DISTINCT for RETURN DISTINCT (parsed but ignored).
+  - Using catalog/JDBC from schema.json at convert time.
+
+  Conventions:
+  - CTE columns named `alias.field` (backtick-quoted).
+  - Anonymous vars: _nN / _rN.
+  - Tests live under src/test; fixture schema/table_size under src/test/resources.
+  - Prefer fixing the generator over hand-editing generated SQL.
+
+rules:
+  proposal:
+    - Keep proposals under 500 words
+    - Always include a Non-goals section when changing converter surface
+  specs:
+    - Requirements describe observable behavior (SQL shape, errors, CLI exits)
+    - Call out parse-vs-convert gaps explicitly when relevant
+  tasks:
+    - Include a regression test for each converter correctness fix
+    - Prefer SqlConverterSpec-style normalize() equality or include() checks

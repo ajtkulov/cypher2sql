@@ -84,6 +84,7 @@ class SqlConverterSpec extends AnyFlatSpec with Matchers:
             r.citizenship AS `r.puppy_id_citizenship`,
             r.person_hash AS `r.puppy_from_person_hash`,
             r.citizenship AS `r.puppy_to_citizenship`,
+            r.citizenship AS `c.citizenship`,
             r.citizenship AS `c.name`
           FROM puppy.people_citizenship AS r
           INNER JOIN step1 AS prev ON r.person_hash = prev.`p.person_hash`
@@ -133,6 +134,7 @@ class SqlConverterSpec extends AnyFlatSpec with Matchers:
             r.citizenship AS `r.puppy_id_citizenship`,
             r.person_hash AS `r.puppy_from_person_hash`,
             r.citizenship AS `r.puppy_to_citizenship`,
+            r.citizenship AS `c.citizenship`,
             r.citizenship AS `c.name`
           FROM puppy.people_agg AS p
           INNER JOIN puppy.people_citizenship AS r ON r.person_hash = p.person_hash
@@ -167,3 +169,15 @@ class SqlConverterSpec extends AnyFlatSpec with Matchers:
     Cypher2Sql.convert("MATCH (x:Unknown) RETURN x", schema) match
       case Left(err) => err should include("Unknown node label")
       case Right(s)  => fail(s"expected error, got $s")
+
+  it should "retain node ids for repeated edge joins" in:
+    val got = sql(
+      """
+        MATCH (p:Person)-[r:CITIZENSHIP]->(c:Citizenship)<-[r1:CITIZENSHIP]-(p1:Person)
+        WHERE p1 <> p
+          AND p.last_name <> p1.last_name
+        RETURN DISTINCT p, c, p1
+        LIMIT 10000
+      """
+    )
+    normalize(got) should include("r1.citizenship = prev.`c.citizenship`")

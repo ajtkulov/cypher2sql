@@ -663,8 +663,9 @@ final class SqlConverter(schema: GraphSchema, tableSizes: TableSizes = TableSize
       )
 
   private def nodeGraphFields(n: Binding.Node): List[String] =
-    if n.nodeType.attributes.nonEmpty then n.nodeType.attributes.map(_.name)
-    else n.nodeType.id.map(_.name)
+    // Keep IDs available in every CTE step so subsequent joins can always reference them,
+    // even when the node also has mapped attributes.
+    (n.nodeType.id ++ n.nodeType.attributes).map(_.name).distinct
 
   private def relGraphFields(r: Binding.Rel): List[String] =
     (r.edgeType.id ++ r.edgeType.fromKey ++ r.edgeType.toKey ++ r.edgeType.attributes)
