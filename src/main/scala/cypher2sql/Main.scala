@@ -1,7 +1,8 @@
 package cypher2sql
 
-import cypher2sql.dataframe.CsvLoader
-import cypher2sql.graph.MappedGraph
+import cypher2sql.dataframe.{CsvInspect, CsvLoader}
+import cypher2sql.graph.{GraphMaterializer, MappedGraph}
+import cypher2sql.mapping.CsvGraphMapping
 import cypher2sql.schema.{SchemaReader, TableSizeReader, TableSizes}
 import cypher2sql.sql.Cypher2Sql
 import cypher2sql.subgraph.SubgraphExecutor
@@ -28,7 +29,7 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments):
   )
   val mode = opt[String](
     name = "mode",
-    descr = "Execution mode: sql (default) or subgraph",
+    descr = "Execution mode: sql (default), subgraph, or inspect",
     default = Some("sql")
   )
   val csvBind = opt[List[String]](
@@ -37,42 +38,66 @@ class Conf(arguments: Seq[String]) extends ScallopConf(arguments):
       "Bind qualified table to CSV (repeatable): --csv-bind schema.table=/path.csv",
     default = Some(Nil)
   )
+  val dataDir = opt[Path](
+    name = "data-dir",
+    descr = "Directory of CSV/TSV files (inspect / mapping modes)",
+    default = Some(Path.of("data"))
+  )
+  val mapping = opt[Path](
+    name = "mapping",
+    descr = "CSV↔graph mapping JSON (subgraph mode with result CSVs)",
+    required = false
+  )
   verify()
 
 @main def main(args: String*): Unit =
   val conf = Conf(args)
-  val schemaPath = conf.schema()
 
-  val schema = SchemaReader.readPath(Path.of(schemaPath)).orElse(
-    SchemaReader.readResource(schemaPath)
-  ) match
+  conf.mode().toLowerCase match
+    case "inspect" =>
+      runInspect(conf.dataDir())
+    case "sql" =>
+      val schema = loadSchema(conf.schema())
+      runSql(schema, conf.tableSize(), readCypher(conf))
+    case "subgraph" =>
+      val schema = loadSchema(conf.schema())
+      conf.mapping.toOption match
+        case Some(mappingPath) =>
+          runSubgraphMapped(schema, conf.dataDir(), mappingPath, readCypher(conf))
+        case None =>
+          runSubgraphBinds(schema, conf.csvBind(), readCypher(conf))
+    case other =>
+      System.err.println(s"Unknown mode: $other (expected sql, subgraph, or inspect)")
+      sys.exit(1)
+
+private def loadSchema(schemaPath: String) =
+  SchemaReader.readPath(Path.of(schemaPath)).orElse(SchemaReader.readResource(schemaPath)) match
     case Right(s)  => s
     case Left(err) =>
       System.err.println(err)
       sys.exit(1)
 
-  val cypherText =
-    conf.cypher.toOption match
-      case Some(path) =>
-        if !Files.isRegularFile(path) then
-          System.err.println(s"Cypher file not found: $path")
-          sys.exit(1)
-        Files.readString(path)
-      case None =>
-        """
-          MATCH (p:Person)-[r:CITIZENSHIP]->(c:Citizenship)
-          WHERE p.last_name = 'John'
-          RETURN p, c.name
-          LIMIT 100
-        """
+private def readCypher(conf: Conf): String =
+  conf.cypher.toOption match
+    case Some(path) =>
+      if !Files.isRegularFile(path) then
+        System.err.println(s"Cypher file not found: $path")
+        sys.exit(1)
+      Files.readString(path)
+    case None =>
+      """
+        MATCH (p:Person)-[r:CITIZENSHIP]->(c:Citizenship)
+        WHERE p.last_name = 'John'
+        RETURN p, c.name
+        LIMIT 100
+      """
 
-  conf.mode().toLowerCase match
-    case "subgraph" =>
-      runSubgraph(schema, conf.csvBind(), cypherText)
-    case "sql" =>
-      runSql(schema, conf.tableSize(), cypherText)
-    case other =>
-      System.err.println(s"Unknown mode: $other (expected sql or subgraph)")
+private def runInspect(dataDir: Path): Unit =
+  CsvInspect.inspectDir(dataDir) match
+    case Right(summaries) =>
+      print(CsvInspect.formatReport(summaries))
+    case Left(err) =>
+      System.err.println(err)
       sys.exit(1)
 
 private def runSql(
@@ -93,7 +118,7 @@ private def runSql(
       System.err.println(err)
       sys.exit(1)
 
-private def runSubgraph(
+private def runSubgraphBinds(
     schema: cypher2sql.schema.GraphSchema,
     binds: List[String],
     cypherText: String
@@ -117,7 +142,9 @@ private def runSubgraph(
       sys.exit(1)
 
   if pathMap.isEmpty then
-    System.err.println("subgraph mode requires at least one --csv-bind schema.table=/path.csv")
+    System.err.println(
+      "subgraph mode requires --mapping <file> or at least one --csv-bind schema.table=/path.csv"
+    )
     sys.exit(1)
 
   val tables: Map[String, Table] =
@@ -135,6 +162,29 @@ private def runSubgraph(
       System.err.println(err)
       sys.exit(1)
 
+  runExecutor(cypherText, graph)
+
+private def runSubgraphMapped(
+    schema: cypher2sql.schema.GraphSchema,
+    dataDir: Path,
+    mappingPath: Path,
+    cypherText: String
+): Unit =
+  val mapping = CsvGraphMapping.load(mappingPath).flatMap(CsvGraphMapping.validateAgainstSchema(_, schema)) match
+    case Right(m) => m
+    case Left(err) =>
+      System.err.println(err)
+      sys.exit(1)
+
+  val graph = GraphMaterializer.materialize(schema, mapping, dataDir) match
+    case Right(g) => g
+    case Left(err) =>
+      System.err.println(err)
+      sys.exit(1)
+
+  runExecutor(cypherText, graph)
+
+private def runExecutor(cypherText: String, graph: MappedGraph): Unit =
   SubgraphExecutor.execute(cypherText, graph) match
     case Right(sg) =>
       println(sg.toPrettyString)

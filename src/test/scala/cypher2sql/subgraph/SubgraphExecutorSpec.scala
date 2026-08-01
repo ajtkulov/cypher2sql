@@ -42,7 +42,7 @@ class SubgraphExecutorSpec extends AnyFlatSpec with Matchers:
     sg.relationships shouldBe empty
 
   it should "return a hop subgraph for Person-CITIZENSHIP-Citizenship" in:
-    val sg = SubgraphExecutor
+    val sg: Subgraph = SubgraphExecutor
       .execute(
         """
           MATCH (p:Person)-[r:CITIZENSHIP]->(c:Citizenship)

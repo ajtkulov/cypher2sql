@@ -15,8 +15,8 @@ class SchemaReaderSpec extends AnyFlatSpec with Matchers:
     schema.catalogs.head.jdbc.flatMap(_.jdbcUri) shouldBe
       Some("jdbc:ch://172.17.0.1:8123")
 
-    schema.nodes.map(_.label) shouldBe List("Person", "Citizenship")
-    schema.edges.map(_.label) shouldBe List("CITIZENSHIP")
+    schema.nodes.map(_.label) shouldBe List("Person", "Citizenship", "INN")
+    schema.edges.map(_.label) shouldBe List("CITIZENSHIP", "HAS_INN")
 
     val person = schema.requireNode("Person")
     person.id.map(_.name) shouldBe List("person_hash")

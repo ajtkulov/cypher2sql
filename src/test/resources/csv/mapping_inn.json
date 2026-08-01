@@ -1,0 +1,44 @@
+{
+  "files": [
+    {
+      "path": "result_inn.tsv",
+      "delimiter": "\t",
+      "nodes": [
+        {
+          "id": "p",
+          "label": "Person",
+          "columns": {
+            "person_hash": "p.person_hash",
+            "first_name": "p.first_name",
+            "last_name": "p.last_name",
+            "middle_name": "p.middle_name",
+            "birth_date": "p.birth_date"
+          }
+        },
+        {
+          "id": "i",
+          "label": "INN",
+          "columns": {
+            "innCode": "i.innCode",
+            "code": "i.code"
+          }
+        },
+        {
+          "id": "p1",
+          "label": "Person",
+          "columns": {
+            "person_hash": "p1.person_hash",
+            "first_name": "p1.first_name",
+            "last_name": "p1.last_name",
+            "middle_name": "p1.middle_name",
+            "birth_date": "p1.birth_date"
+          }
+        }
+      ],
+      "relationships": [
+        { "type": "HAS_INN", "from": "p", "to": "i" },
+        { "type": "HAS_INN", "from": "p1", "to": "i" }
+      ]
+    }
+  ]
+}

@@ -105,6 +105,39 @@
           "type": "STRING"
         }
       ]
+    },
+    {
+      "dataSourceGroup": {
+        "externalDataSource": {
+          "enabled": true,
+          "catalog": "clickhouse_data",
+          "schema": "puppy",
+          "table": "person_inn",
+          "mappedField": [
+            {
+              "sourceFieldName": "innCode",
+              "targetFieldName": "innCode"
+            },
+            {
+              "sourceFieldName": "innCode",
+              "targetFieldName": "code"
+            }
+          ]
+        }
+      },
+      "label": "INN",
+      "id": [
+        {
+          "name": "innCode",
+          "type": "STRING"
+        }
+      ],
+      "attribute": [
+        {
+          "name": "code",
+          "type": "STRING"
+        }
+      ]
     }
   ],
   "edge": [
@@ -157,6 +190,59 @@
       "toKey": [
         {
           "name": "puppy_to_citizenship",
+          "type": "STRING"
+        }
+      ]
+    },
+    {
+      "dataSourceGroup": {
+        "externalDataSource": {
+          "enabled": true,
+          "catalog": "clickhouse_data",
+          "schema": "puppy",
+          "table": "person_inn",
+          "mappedField": [
+            {
+              "sourceFieldName": "person_hash",
+              "targetFieldName": "puppy_id_person_hash"
+            },
+            {
+              "sourceFieldName": "innCode",
+              "targetFieldName": "puppy_id_innCode"
+            },
+            {
+              "sourceFieldName": "person_hash",
+              "targetFieldName": "puppy_from_person_hash"
+            },
+            {
+              "sourceFieldName": "innCode",
+              "targetFieldName": "puppy_to_innCode"
+            }
+          ]
+        }
+      },
+      "label": "HAS_INN",
+      "fromNodeLabel": "Person",
+      "toNodeLabel": "INN",
+      "id": [
+        {
+          "name": "puppy_id_person_hash",
+          "type": "STRING"
+        },
+        {
+          "name": "puppy_id_innCode",
+          "type": "STRING"
+        }
+      ],
+      "fromKey": [
+        {
+          "name": "puppy_from_person_hash",
+          "type": "STRING"
+        }
+      ],
+      "toKey": [
+        {
+          "name": "puppy_to_innCode",
           "type": "STRING"
         }
       ]
