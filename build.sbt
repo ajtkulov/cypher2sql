@@ -10,6 +10,11 @@ lazy val root = (project in file("."))
       "io.circe" %% "circe-generic" % "0.14.12",
       "io.circe" %% "circe-parser"  % "0.14.12",
       "org.rogach" %% "scallop" % "5.3.0",
+      // DataFrame-like CSV tables for in-memory subgraph execution (no Spark).
+      "tech.tablesaw" % "tablesaw-core" % "0.43.1",
+      // Optional Apache Arrow interchange — enable when implementing ArrowInterop:
+      // "org.apache.arrow" % "arrow-vector" % "15.0.2",
+      // "org.apache.arrow" % "arrow-memory-netty" % "15.0.2",
       "org.scalatest" %% "scalatest" % "3.2.19" % Test
     ),
     Compile / mainClass := Some("cypher2sql.main"),

@@ -1,0 +1,4 @@
+person_hash,first_name,last_name,middle_name,birth_date
+p1,Alice,John,M,1990-01-01
+p2,Bob,Smith,A,1985-05-05
+p3,Carol,John,B,1992-03-03
