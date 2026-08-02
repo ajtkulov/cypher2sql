@@ -35,7 +35,52 @@ private final class ExecError(val msg: String) extends RuntimeException(msg)
 private final class SubgraphExecutor(graph: MappedGraph):
   private var anon = 0
 
+  /** Cached node snapshots + id → node index per label. */
+  private val nodeCache =
+    scala.collection.mutable.Map.empty[String, (List[EntityVal.Node], Map[String, EntityVal.Node])]
+
+  /** Cached edge rows + indexes by from-key / to-key physical values. */
+  private val edgeCache =
+    scala.collection.mutable.Map.empty[String, EdgeIndex]
+
+  private final case class EdgeIndex(
+      rows: List[Map[String, String]],
+      byFrom: Map[String, List[Map[String, String]]],
+      byTo: Map[String, List[Map[String, String]]],
+      fromSrc: List[String],
+      toSrc: List[String]
+  )
+
   private def fail(msg: String): Nothing = throw ExecError(msg)
+
+  private def nodesFor(label: String): (List[EntityVal.Node], Map[String, EntityVal.Node]) =
+    nodeCache.getOrElseUpdate(
+      label, {
+        val nt = graph.schema.node(label).getOrElse(fail(s"Unknown node label: $label"))
+        val table = graph.nodeTable(label).fold(fail, identity)
+        val nodes = scanNodes(nt, table)
+        val idFields = nt.id.map(_.name)
+        val byId = nodes.map(n => idFields.map(f => n.props.getOrElse(f, "")).mkString("\u0000") -> n).toMap
+        (nodes, byId)
+      }
+    )
+
+  private def edgesFor(edgeType: EdgeType): EdgeIndex =
+    edgeCache.getOrElseUpdate(
+      edgeType.label, {
+        val (_, edgeTable) = graph.edgeTable(edgeType.label).fold(fail, identity)
+        val fromSrc =
+          edgeType.fromKey.map(f => graph.edgeSourceCol(edgeType, f.name).fold(fail, identity))
+        val toSrc =
+          edgeType.toKey.map(f => graph.edgeSourceCol(edgeType, f.name).fold(fail, identity))
+        val rows = snapshotTable(edgeTable)
+        def key(row: Map[String, String], cols: List[String]): String =
+          cols.map(c => row.getOrElse(c, "")).mkString("\u0000")
+        val byFrom = rows.groupBy(r => key(r, fromSrc))
+        val byTo = rows.groupBy(r => key(r, toSrc))
+        EdgeIndex(rows, byFrom, byTo, fromSrc, toSrc)
+      }
+    )
 
   def run(query: Query): Subgraph =
     val matches = query.clauses.collect { case m: Match => m }
@@ -86,8 +131,7 @@ private final class SubgraphExecutor(graph: MappedGraph):
         node.labels.headOption.getOrElse(fail(s"Node variable '$alias' requires a label"))
       if node.labels.size > 1 then fail(s"Multiple labels not supported: ${node.labels}")
       val nt = graph.schema.node(label).getOrElse(fail(s"Unknown node label: $label"))
-      val table = graph.nodeTable(label).fold(fail, identity)
-      val nodes = scanNodes(nt, table).filter: n =>
+      val nodes = nodesFor(label)._1.filter: n =>
         propsMatch(n.props, node.properties)
 
       if rows == List(Map.empty) || rows.forall(_.isEmpty) then
@@ -128,18 +172,10 @@ private final class SubgraphExecutor(graph: MappedGraph):
     val rightAlias = right.variable.getOrElse(fresh("_n"))
     val edgeType =
       graph.schema.edge(rel.types.head).getOrElse(fail(s"Unknown relationship type: ${rel.types.head}"))
-    val (_, edgeTable) = graph.edgeTable(edgeType.label).fold(fail, identity)
 
-    // Left endpoint variable is the one already in rows that matches from/to.
-    // Path is written left-[rel]-right; left is whatever was last bound in the chain.
-    // We find left as the most recently introduced node still needed — use start of hop:
-    // callers always have the left node as the previous right/start.
     val leftAlias = inferLeftAlias(rows, edgeType, rel.direction)
     val outgoing = resolveOutgoing(rel.direction, edgeType, leftAlias, rows, right.labels.headOption)
 
-    val leftNodeType =
-      graph.schema.node(if outgoing then edgeType.fromNodeLabel else edgeType.toNodeLabel)
-        .getOrElse(fail("Missing endpoint node type"))
     val rightExpected = if outgoing then edgeType.toNodeLabel else edgeType.fromNodeLabel
     if right.labels.nonEmpty && !right.labels.contains(rightExpected) then
       fail(s"Expected label $rightExpected for '$rightAlias', got ${right.labels}")
@@ -151,19 +187,7 @@ private final class SubgraphExecutor(graph: MappedGraph):
 
     val fromKeyFields = edgeType.fromKey.map(_.name)
     val toKeyFields = edgeType.toKey.map(_.name)
-    val fromSrc = fromKeyFields.map(f => graph.edgeSourceCol(edgeType, f).fold(fail, identity))
-    val toSrc = toKeyFields.map(f => graph.edgeSourceCol(edgeType, f).fold(fail, identity))
-
-    val edgeSnapshots: List[Map[String, String]] =
-      edgeTable.columnNames().asScala.toList match
-        case cols =>
-          edgeTable
-            .stream()
-            .iterator()
-            .asScala
-            .map: erow =>
-              cols.map(c => c -> cellValue(erow, c)).toMap
-            .toList
+    val idx = edgesFor(edgeType)
 
     rows.flatMap: prev =>
       val left = prev.getOrElse(
@@ -176,48 +200,47 @@ private final class SubgraphExecutor(graph: MappedGraph):
       val leftIdFields =
         if outgoing then graph.schema.requireNode(edgeType.fromNodeLabel).id.map(_.name)
         else graph.schema.requireNode(edgeType.toNodeLabel).id.map(_.name)
-      val leftIdVals = leftIdFields.map(f => left.props.getOrElse(f, ""))
-      val joinSrcCols = if outgoing then fromSrc else toSrc
+      val leftIdKey = leftIdFields.map(f => left.props.getOrElse(f, "")).mkString("\u0000")
+      val candidates =
+        if outgoing then idx.byFrom.getOrElse(leftIdKey, Nil)
+        else idx.byTo.getOrElse(leftIdKey, Nil)
 
-      edgeSnapshots.flatMap: erow =>
-        val edgeKeyVals = joinSrcCols.map(c => erow.getOrElse(c, ""))
-        if edgeKeyVals != leftIdVals then None
+      candidates.flatMap: erow =>
+        val relProps = graph.edgeGraphFields(edgeType).flatMap { gf =>
+          graph.edgeSourceCol(edgeType, gf).toOption.map(src => gf -> erow.getOrElse(src, ""))
+        }.toMap
+        val fromProps = fromKeyFields.zip(idx.fromSrc).map { case (gf, src) =>
+          gf -> erow.getOrElse(src, "")
+        }.toMap
+        val toProps = toKeyFields.zip(idx.toSrc).map { case (gf, src) =>
+          gf -> erow.getOrElse(src, "")
+        }.toMap
+        val relVal = EntityVal.Rel(edgeType.label, relProps, fromProps, toProps)
+
+        val otherKeySrc = if outgoing then idx.toSrc else idx.fromSrc
+        val otherKeyVals = otherKeySrc.map(c => erow.getOrElse(c, ""))
+        val otherIdFields = rightNodeType.id.map(_.name)
+        if otherIdFields.size != otherKeyVals.size then
+          fail(s"Key arity mismatch for ${edgeType.label}")
+
+        val rightNode = resolveRightNode(
+          rightNodeType,
+          otherIdFields.zip(otherKeyVals).toMap,
+          edgeType,
+          erow,
+          coLocated =
+            rightNodeType.table.map(_.qualifiedTable) == edgeType.table.map(_.qualifiedTable)
+        )
+        if !propsMatch(rightNode.props, right.properties) then None
+        else if prev.contains(rightAlias) then
+          prev(rightAlias) match
+            case existing: EntityVal.Node if existing.props == rightNode.props =>
+              val row = prev + (relAlias -> relVal)
+              if where.forall(eval(_, row)) then Some(row) else None
+            case _ => None
         else
-          val relProps = graph.edgeGraphFields(edgeType).flatMap { gf =>
-            graph.edgeSourceCol(edgeType, gf).toOption.map(src => gf -> erow.getOrElse(src, ""))
-          }.toMap
-          val fromProps = fromKeyFields.zip(fromSrc).map { case (gf, src) =>
-            gf -> erow.getOrElse(src, "")
-          }.toMap
-          val toProps = toKeyFields.zip(toSrc).map { case (gf, src) =>
-            gf -> erow.getOrElse(src, "")
-          }.toMap
-          val relVal = EntityVal.Rel(edgeType.label, relProps, fromProps, toProps)
-
-          val otherKeySrc = if outgoing then toSrc else fromSrc
-          val otherKeyVals = otherKeySrc.map(c => erow.getOrElse(c, ""))
-          val otherIdFields = rightNodeType.id.map(_.name)
-          if otherIdFields.size != otherKeyVals.size then
-            fail(s"Key arity mismatch for ${edgeType.label}")
-
-          val rightNode = resolveRightNode(
-            rightNodeType,
-            otherIdFields.zip(otherKeyVals).toMap,
-            edgeType,
-            erow,
-            coLocated =
-              rightNodeType.table.map(_.qualifiedTable) == edgeType.table.map(_.qualifiedTable)
-          )
-          if !propsMatch(rightNode.props, right.properties) then None
-          else if prev.contains(rightAlias) then
-            prev(rightAlias) match
-              case existing: EntityVal.Node if existing.props == rightNode.props =>
-                val row = prev + (relAlias -> relVal)
-                if where.forall(eval(_, row)) then Some(row) else None
-              case _ => None
-          else
-            val row = prev + (relAlias -> relVal) + (rightAlias -> rightNode)
-            if where.forall(eval(_, row)) then Some(row) else None
+          val row = prev + (relAlias -> relVal) + (rightAlias -> rightNode)
+          if where.forall(eval(_, row)) then Some(row) else None
 
   private def inferLeftAlias(
       rows: List[Row],
@@ -274,16 +297,11 @@ private final class SubgraphExecutor(graph: MappedGraph):
       }
       EntityVal.Node(nodeType.label, withIds)
     else
-      val table = graph.nodeTable(nodeType.label).fold(fail, identity)
-      val idFields = nodeType.id.map(_.name)
-      val idSrc = idFields.map(f => graph.nodeSourceCol(nodeType, f).fold(fail, identity))
-      val want = idFields.map(idMap)
-      snapshotTable(table)
-        .map: row =>
-          val got = idSrc.map(c => row.getOrElse(c, ""))
-          if got == want then Some(rowToNodeFromMap(nodeType, row)) else None
-        .collectFirst { case Some(n) => n }
-        .getOrElse(EntityVal.Node(nodeType.label, idMap))
+      val idKey = nodeType.id.map(f => idMap.getOrElse(f.name, "")).mkString("\u0000")
+      nodesFor(nodeType.label)._2.getOrElse(
+        idKey,
+        EntityVal.Node(nodeType.label, idMap)
+      )
 
   private def snapshotTable(table: Table): List[Map[String, String]] =
     val cols = table.columnNames().asScala.toList
