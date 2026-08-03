@@ -216,7 +216,7 @@ object GraphMaterializer:
     allCols.foreach(c => data(c) = mutable.ArrayBuffer.empty)
 
     existing.foreach: t =>
-      val names = t.columnNames().asScala.toList``
+      val names = t.columnNames().asScala.toList
       (0 until t.rowCount()).foreach: i =>
         allCols.foreach: c =>
           val v =
